@@ -81,6 +81,25 @@ export function useAIChat(): UseAIChatReturn {
   const sendMessage = useCallback(async (content: string) => {
     if (!content.trim() || isStreaming) return;
 
+    // 先检查配置是否完整
+    let cfg: AIConfig;
+    try {
+      cfg = await getConfig();
+    } catch {
+      setSession(prev => ({
+        ...prev,
+        messages: [...prev.messages, { role: 'assistant', content: 'Error: 无法读取 AI 配置，请先在设置中配置 API Key' }],
+      }));
+      return;
+    }
+    if (!cfg.api_key || !cfg.base_url || !cfg.model) {
+      setSession(prev => ({
+        ...prev,
+        messages: [...prev.messages, { role: 'assistant', content: `Error: 配置不完整 (provider=${cfg.provider}, base_url=${cfg.base_url || 'empty'}, model=${cfg.model || 'empty'})，请前往设置页面填写并保存` }],
+      }));
+      return;
+    }
+
     const currentSession = sessionRef.current;
 
     // 添加用户消息

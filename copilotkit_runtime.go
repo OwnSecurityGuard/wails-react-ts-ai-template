@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,13 +16,22 @@ import (
 )
 
 // CopilotKitRuntime 提供 CopilotKit 的 HTTP Runtime 端点
-// 实现 AG-UI 协议，让前端 CopilotKit 组件能够直接连接
+// 实现 AG-UI 协议，让前端 CopilotKit 组件能够直接连接。
+// 当前实现支持文本流式输出与工具调用（function calling）闭环：
+//   1. 前端 POST /agent/default/run 启动一次运行（SSE 流）
+//   2. 后端流式调用 LLM，遇到 tool_calls 时推送 TOOL_CALL_* 事件
+//   3. 后端推送 RUN_WAITING_FOR_TOOL_RESULTS 事件并阻塞等待
+//   4. 前端执行工具后 POST /agent/default/run/{threadId}/tool-result
+//   5. 后端追加 tool 消息，再次调用 LLM，继续流式输出
+// 状态全部保存在内存中，应用重启后丢失。
 type CopilotKitRuntime struct {
-	aiService   *AIService
-	server      *http.Server
-	port        int
-	cancelMap   map[string]context.CancelFunc
-	mu          sync.Mutex
+	aiService *AIService
+	server    *http.Server
+	port      int
+
+	// runs 保存进行中的运行，key 为 threadID
+	runs map[string]*agentRun
+	mu   sync.RWMutex
 }
 
 // NewCopilotKitRuntime 创建 Runtime 实例
@@ -29,7 +39,7 @@ func NewCopilotKitRuntime(aiService *AIService) *CopilotKitRuntime {
 	return &CopilotKitRuntime{
 		aiService: aiService,
 		port:      18999,
-		cancelMap: make(map[string]context.CancelFunc),
+		runs:      make(map[string]*agentRun),
 	}
 }
 
@@ -44,7 +54,7 @@ func (r *CopilotKitRuntime) Start() error {
 	// Runtime info endpoint
 	mux.HandleFunc(basePath+"/info", r.handleInfo)
 
-	// Agent run endpoint (SSE)
+	// Agent run endpoint (SSE) 与 tool-result 续跑端点
 	mux.HandleFunc(basePath+"/agent/", r.handleAgent)
 
 	// 处理 OPTIONS 预检请求
@@ -119,7 +129,7 @@ func (r *CopilotKitRuntime) handleInfo(w http.ResponseWriter, req *http.Request)
 			{
 				"id":          "default",
 				"name":        "default",
-				"description": "Default AI assistant",
+				"description": "Default AI assistant with tool calling support",
 			},
 		},
 	}
@@ -143,10 +153,14 @@ func (r *CopilotKitRuntime) handleAgent(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	// 解析剩余路径: run, connect, stop/:threadId
+	// 解析剩余路径: run, run/:threadId/tool-result, connect, stop/:threadId
 	if len(parts) >= 2 {
 		switch parts[1] {
 		case "run":
+			if len(parts) >= 4 && parts[2] != "" && parts[3] == "tool-result" {
+				r.handleToolResult(w, req, parts[2])
+				return
+			}
 			r.handleRun(w, req)
 			return
 		case "connect":
@@ -177,11 +191,13 @@ type RunAgentInput struct {
 
 // AGUIMessage AG-UI 消息格式
 type AGUIMessage struct {
-	ID        string      `json:"id"`
-	Role      string      `json:"role"`
-	Content   interface{} `json:"content,omitempty"` // string or []InputContent
-	Name      string      `json:"name,omitempty"`
+	ID        string         `json:"id"`
+	Role      string         `json:"role"`
+	Content   interface{}    `json:"content,omitempty"` // string or []InputContent
+	Name      string         `json:"name,omitempty"`
 	ToolCalls []AGUIToolCall `json:"toolCalls,omitempty"`
+	// ToolCallID 用于 role="tool" 的消息，对应 assistant 之前发起的 tool_call
+	ToolCallID string `json:"toolCallId,omitempty"`
 }
 
 // AGUITool AG-UI 工具定义
@@ -193,21 +209,21 @@ type AGUITool struct {
 
 // AGUIContext AG-UI 上下文
 type AGUIContext struct {
-	Name    string      `json:"name"`
-	Value   interface{} `json:"value"`
+	Name  string      `json:"name"`
+	Value interface{} `json:"value"`
 }
 
 // AGUIToolCall 工具调用
 type AGUIToolCall struct {
-	ID       string          `json:"id"`
-	Type     string          `json:"type"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
 	Function AGUIToolFunction `json:"function"`
 }
 
 // AGUIToolFunction 工具函数信息
 type AGUIToolFunction struct {
-	Name      string          `json:"name"`
-	Arguments string          `json:"arguments"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // BaseEvent AG-UI 基础事件
@@ -237,6 +253,14 @@ type RunErrorEvent struct {
 	ThreadID string    `json:"threadId"`
 	RunID    string    `json:"runId"`
 	Error    AGUIError `json:"error"`
+}
+
+// RunWaitingForToolResultsEvent 通知前端执行工具并回传结果
+type RunWaitingForToolResultsEvent struct {
+	BaseEvent
+	ThreadID  string         `json:"threadId"`
+	RunID     string         `json:"runId"`
+	ToolCalls []AGUIToolCall `json:"toolCalls"`
 }
 
 // AGUIError AG-UI 错误
@@ -298,18 +322,97 @@ type StateSnapshotEvent struct {
 }
 
 const (
-	EventTypeRunStarted        = "RUN_STARTED"
-	EventTypeRunFinished       = "RUN_FINISHED"
-	EventTypeRunError          = "RUN_ERROR"
-	EventTypeTextMessageStart  = "TEXT_MESSAGE_START"
-	EventTypeTextMessageContent= "TEXT_MESSAGE_CONTENT"
-	EventTypeTextMessageEnd    = "TEXT_MESSAGE_END"
-	EventTypeMessagesSnapshot  = "MESSAGES_SNAPSHOT"
-	EventTypeToolCallStart     = "TOOL_CALL_START"
-	EventTypeToolCallArgs      = "TOOL_CALL_ARGS"
-	EventTypeToolCallEnd       = "TOOL_CALL_END"
-	EventTypeStateSnapshot     = "STATE_SNAPSHOT"
+	EventTypeRunStarted              = "RUN_STARTED"
+	EventTypeRunFinished             = "RUN_FINISHED"
+	EventTypeRunError                = "RUN_ERROR"
+	EventTypeRunWaitingForToolResults = "RUN_WAITING_FOR_TOOL_RESULTS"
+	EventTypeTextMessageStart        = "TEXT_MESSAGE_START"
+	EventTypeTextMessageContent      = "TEXT_MESSAGE_CONTENT"
+	EventTypeTextMessageEnd          = "TEXT_MESSAGE_END"
+	EventTypeMessagesSnapshot        = "MESSAGES_SNAPSHOT"
+	EventTypeToolCallStart           = "TOOL_CALL_START"
+	EventTypeToolCallArgs            = "TOOL_CALL_ARGS"
+	EventTypeToolCallEnd             = "TOOL_CALL_END"
+	EventTypeStateSnapshot           = "STATE_SNAPSHOT"
 )
+
+// pendingToolCall 累积流式响应中的单个工具调用
+type pendingToolCall struct {
+	ID        string
+	Type      string
+	Name      string
+	Arguments string
+}
+
+// toolResult 前端执行完工具后回传的结果
+type toolResult struct {
+	ToolCallID string `json:"toolCallId"`
+	Name       string `json:"name"`
+	Result     string `json:"result"`
+}
+
+// SubmitToolResultsInput 前端提交工具结果的请求体
+type SubmitToolResultsInput struct {
+	ThreadID    string       `json:"threadId"`
+	RunID       string       `json:"runId"`
+	ToolResults []toolResult `json:"toolResults"`
+}
+
+// agentRun 单次运行的状态机
+type agentRun struct {
+	threadID string
+	runID    string
+	messages []openai.ChatCompletionMessage
+	tools    []openai.Tool
+
+	// eventCh 向 SSE 客户端推送事件，带缓冲避免 goroutine 阻塞
+	eventCh chan interface{}
+	// toolResultCh 接收前端执行完工具后的结果
+	toolResultCh chan []toolResult
+	// cancel 用于客户端断开或主动停止时中断运行
+	cancel context.CancelFunc
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func (run *agentRun) appendMessages(msgs ...openai.ChatCompletionMessage) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	run.messages = append(run.messages, msgs...)
+}
+
+func (run *agentRun) getMessages() []openai.ChatCompletionMessage {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	out := make([]openai.ChatCompletionMessage, len(run.messages))
+	copy(out, run.messages)
+	return out
+}
+
+func (run *agentRun) emit(ev interface{}) {
+	run.mu.Lock()
+	closed := run.closed
+	run.mu.Unlock()
+	if closed {
+		return
+	}
+	select {
+	case run.eventCh <- ev:
+	case <-time.After(5 * time.Second):
+		log.Printf("[CopilotKit Runtime] event channel blocked, dropping event %T", ev)
+	}
+}
+
+func (run *agentRun) close() {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.closed {
+		return
+	}
+	run.closed = true
+	close(run.eventCh)
+}
 
 // handleRun 处理 agent run 请求（SSE）
 func (r *CopilotKitRuntime) handleRun(w http.ResponseWriter, req *http.Request) {
@@ -330,7 +433,6 @@ func (r *CopilotKitRuntime) handleRun(w http.ResponseWriter, req *http.Request) 
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	// 获取 flusher
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
@@ -338,17 +440,37 @@ func (r *CopilotKitRuntime) handleRun(w http.ResponseWriter, req *http.Request) 
 	}
 
 	ctx, cancel := context.WithCancel(req.Context())
-	defer cancel()
 
-	// 存储 cancel 函数以便 stop 使用
+	// 转换消息与工具
+	openaiMessages := convertAGUIMessages(input.Messages)
+	openaiTools := convertAGUITools(input.Tools)
+
+	run := &agentRun{
+		threadID:     input.ThreadID,
+		runID:        input.RunID,
+		messages:     openaiMessages,
+		tools:        openaiTools,
+		eventCh:      make(chan interface{}, 64),
+		toolResultCh: make(chan []toolResult, 1),
+		cancel:       cancel,
+	}
+
+	// 保存运行状态
 	r.mu.Lock()
-	r.cancelMap[input.ThreadID] = cancel
+	r.runs[input.ThreadID] = run
 	r.mu.Unlock()
-	defer func() {
+
+	// 清理函数
+	cleanup := func() {
+		cancel()
 		r.mu.Lock()
-		delete(r.cancelMap, input.ThreadID)
+		delete(r.runs, input.ThreadID)
 		r.mu.Unlock()
-	}()
+	}
+	defer cleanup()
+
+	// 启动 agent 循环
+	go r.agentLoop(ctx, run)
 
 	// 发送 RUN_STARTED
 	sendEvent(w, flusher, RunStartedEvent{
@@ -363,16 +485,12 @@ func (r *CopilotKitRuntime) handleRun(w http.ResponseWriter, req *http.Request) 
 		Messages:  input.Messages,
 	})
 
-	// 执行流式聊天
-	r.runStream(ctx, w, flusher, input)
-
-	// 发送 RUN_FINISHED（如果没有错误且没有被取消）
-	if ctx.Err() == nil {
-		sendEvent(w, flusher, RunFinishedEvent{
-			BaseEvent: BaseEvent{Type: EventTypeRunFinished, Timestamp: nowMillis()},
-			ThreadID:  input.ThreadID,
-			RunID:     input.RunID,
-		})
+	// 从 eventCh 读取事件并推送到 SSE
+	for ev := range run.eventCh {
+		sendEvent(w, flusher, ev)
+		if _, finished := ev.(RunFinishedEvent); finished {
+			break
+		}
 	}
 }
 
@@ -403,193 +521,214 @@ func (r *CopilotKitRuntime) handleStop(w http.ResponseWriter, req *http.Request,
 	}
 
 	r.mu.Lock()
-	cancel, ok := r.cancelMap[threadID]
+	run, ok := r.runs[threadID]
 	r.mu.Unlock()
 
-	if ok && cancel != nil {
-		cancel()
+	if ok && run != nil && run.cancel != nil {
+		run.cancel()
 	}
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-// runStream 执行流式 LLM 调用并发送 AG-UI 事件
-func (r *CopilotKitRuntime) runStream(
-	ctx context.Context,
-	w http.ResponseWriter,
-	flusher http.Flusher,
-	input RunAgentInput,
-) {
-	cfg := r.aiService.configStore.Get()
-	if cfg.APIKey == "" {
-		sendEvent(w, flusher, RunErrorEvent{
-			BaseEvent: BaseEvent{Type: EventTypeRunError, Timestamp: nowMillis()},
-			ThreadID:  input.ThreadID,
-			RunID:     input.RunID,
-			Error:     AGUIError{Code: "CONFIG_ERROR", Message: "API Key not configured"},
-		})
+// handleToolResult 接收前端执行完工具后的结果，唤醒 agentLoop 继续运行
+func (r *CopilotKitRuntime) handleToolResult(w http.ResponseWriter, req *http.Request, threadID string) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 转换 AG-UI 消息为 OpenAI 消息格式
-	openaiMessages := make([]openai.ChatCompletionMessage, 0, len(input.Messages))
-	for _, msg := range input.Messages {
-		content := ""
-		switch v := msg.Content.(type) {
-		case string:
-			content = v
-		case []interface{}:
-			// 多模态内容，简化处理取第一个 text
-			for _, item := range v {
-				if m, ok := item.(map[string]interface{}); ok {
-					if m["type"] == "text" {
-						if text, ok := m["text"].(string); ok {
-							content = text
-							break
-						}
-					}
-				}
-			}
+	var input SubmitToolResultsInput
+	if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	r.mu.RLock()
+	run, ok := r.runs[threadID]
+	r.mu.RUnlock()
+
+	if !ok || run == nil {
+		http.Error(w, "Run not found", http.StatusNotFound)
+		return
+	}
+
+	if run.runID != input.RunID {
+		http.Error(w, "Run ID mismatch", http.StatusBadRequest)
+		return
+	}
+
+	select {
+	case run.toolResultCh <- input.ToolResults:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	case <-time.After(5 * time.Second):
+		http.Error(w, "Run not waiting for tool results", http.StatusConflict)
+	}
+}
+
+// agentLoop 运行 Agent 主循环，处理多轮工具调用
+func (r *CopilotKitRuntime) agentLoop(ctx context.Context, run *agentRun) {
+	defer run.close()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
 
-		openaiMessages = append(openaiMessages, openai.ChatCompletionMessage{
-			Role:    msg.Role,
-			Content: content,
+		hasToolCalls, err := r.runOneTurn(ctx, run)
+		if err != nil {
+			return
+		}
+
+		if !hasToolCalls {
+			// 没有工具调用，本次运行自然结束
+			run.emit(RunFinishedEvent{
+				BaseEvent: BaseEvent{Type: EventTypeRunFinished, Timestamp: nowMillis()},
+				ThreadID:  run.threadID,
+				RunID:     run.runID,
+			})
+			return
+		}
+
+		// 有工具调用，等待前端执行结果
+		select {
+		case <-ctx.Done():
+			return
+		case results := <-run.toolResultCh:
+			toolMsgs := make([]openai.ChatCompletionMessage, 0, len(results))
+			for _, tr := range results {
+				toolMsgs = append(toolMsgs, openai.ChatCompletionMessage{
+					Role:       "tool",
+					Content:    tr.Result,
+					ToolCallID: tr.ToolCallID,
+					Name:       tr.Name,
+				})
+			}
+			run.appendMessages(toolMsgs...)
+		}
+	}
+}
+
+// runOneTurn 执行一轮 LLM 流式调用。返回值表示本轮是否产生了需要前端执行的工具调用。
+func (r *CopilotKitRuntime) runOneTurn(ctx context.Context, run *agentRun) (bool, error) {
+	cfg := r.aiService.configStore.Get()
+	if cfg.APIKey == "" {
+		run.emit(RunErrorEvent{
+			BaseEvent: BaseEvent{Type: EventTypeRunError, Timestamp: nowMillis()},
+			ThreadID:  run.threadID,
+			RunID:     run.runID,
+			Error:     AGUIError{Code: "CONFIG_ERROR", Message: "API Key not configured"},
 		})
+		return false, errors.New("api key not configured")
 	}
 
-	clientConfig := openai.DefaultConfig(cfg.APIKey)
-	if cfg.BaseURL != "" {
-		clientConfig.BaseURL = cfg.BaseURL
-	}
-	client := openai.NewClientWithConfig(clientConfig)
+	client := newOpenAIClient(cfg)
 
 	req := openai.ChatCompletionRequest{
 		Model:       cfg.Model,
-		Messages:    openaiMessages,
-		MaxTokens:   cfg.MaxTokens,
+		Messages:    run.getMessages(),
+		MaxTokens:   effectiveMaxTokens(cfg.MaxTokens),
 		Temperature: float32(cfg.Temperature),
+		TopP:        float32(cfg.TopP),
 		Stream:      true,
-	}
-
-	// 如果有 tools，添加到请求中
-	if len(input.Tools) > 0 {
-		openaiTools := make([]openai.Tool, 0, len(input.Tools))
-		for _, tool := range input.Tools {
-			paramsJSON, _ := json.Marshal(tool.Parameters)
-			openaiTools = append(openaiTools, openai.Tool{
-				Type: openai.ToolTypeFunction,
-				Function: &openai.FunctionDefinition{
-					Name:        tool.Name,
-					Description: tool.Description,
-					Parameters:  paramsJSON,
-				},
-			})
-		}
-		req.Tools = openaiTools
+		Tools:       run.tools,
 	}
 
 	stream, err := client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		sendEvent(w, flusher, RunErrorEvent{
+		run.emit(RunErrorEvent{
 			BaseEvent: BaseEvent{Type: EventTypeRunError, Timestamp: nowMillis()},
-			ThreadID:  input.ThreadID,
-			RunID:     input.RunID,
+			ThreadID:  run.threadID,
+			RunID:     run.runID,
 			Error:     AGUIError{Code: "MODEL_ERROR", Message: fmt.Sprintf("create stream: %v", err)},
 		})
-		return
+		return false, err
 	}
 	defer stream.Close()
 
 	messageID := fmt.Sprintf("msg_%d", nowMillis())
-
-	// 发送 TEXT_MESSAGE_START
-	sendEvent(w, flusher, TextMessageStartEvent{
+	run.emit(TextMessageStartEvent{
 		BaseEvent: BaseEvent{Type: EventTypeTextMessageStart, Timestamp: nowMillis()},
 		MessageID: messageID,
 		Role:      "assistant",
 	})
 
+	var contentBuf strings.Builder
+	pendingCalls := make(map[string]*pendingToolCall)
+
+streamLoop:
 	for {
 		select {
 		case <-ctx.Done():
-			// 被取消，发送结束事件
-			sendEvent(w, flusher, TextMessageEndEvent{
+			run.emit(TextMessageEndEvent{
 				BaseEvent: BaseEvent{Type: EventTypeTextMessageEnd, Timestamp: nowMillis()},
 				MessageID: messageID,
 			})
-			return
+			return false, nil
 		default:
 		}
 
 		response, err := stream.Recv()
 		if err != nil {
 			if err == io.EOF {
-				sendEvent(w, flusher, TextMessageEndEvent{
-					BaseEvent: BaseEvent{Type: EventTypeTextMessageEnd, Timestamp: nowMillis()},
-					MessageID: messageID,
-				})
-				return
+				break streamLoop
 			}
-			sendEvent(w, flusher, RunErrorEvent{
+			run.emit(RunErrorEvent{
 				BaseEvent: BaseEvent{Type: EventTypeRunError, Timestamp: nowMillis()},
-				ThreadID:  input.ThreadID,
-				RunID:     input.RunID,
+				ThreadID:  run.threadID,
+				RunID:     run.runID,
 				Error:     AGUIError{Code: "STREAM_ERROR", Message: fmt.Sprintf("stream error: %v", err)},
 			})
-			return
+			return false, err
 		}
 
-		if len(response.Choices) > 0 {
-			delta := response.Choices[0].Delta
+		if len(response.Choices) == 0 {
+			continue
+		}
+		delta := response.Choices[0].Delta
 
-			// 处理文本内容
-			if delta.Content != "" {
-				sendEvent(w, flusher, TextMessageContentEvent{
-					BaseEvent: BaseEvent{Type: EventTypeTextMessageContent, Timestamp: nowMillis()},
-					MessageID: messageID,
-					Delta:     delta.Content,
-				})
-			}
+		if delta.Content != "" {
+			contentBuf.WriteString(delta.Content)
+			run.emit(TextMessageContentEvent{
+				BaseEvent: BaseEvent{Type: EventTypeTextMessageContent, Timestamp: nowMillis()},
+				MessageID: messageID,
+				Delta:     delta.Content,
+			})
+		}
 
-			// 处理工具调用（简化版，实际需累积参数）
-			if len(delta.ToolCalls) > 0 {
-				for _, tc := range delta.ToolCalls {
-					if tc.ID != "" {
-						sendEvent(w, flusher, ToolCallStartEvent{
-							BaseEvent:    BaseEvent{Type: EventTypeToolCallStart, Timestamp: nowMillis()},
-							ToolCallID:   tc.ID,
-							ToolCallName: tc.Function.Name,
-						})
+		if len(delta.ToolCalls) > 0 {
+			for _, tc := range delta.ToolCalls {
+				id := tc.ID
+				// OpenAI 流式工具调用偶尔会在后续 delta 里把 ID 置空，沿用已有 ID
+				if id == "" && len(pendingCalls) == 1 {
+					for k := range pendingCalls {
+						id = k
+						break
 					}
-					if tc.Function.Arguments != "" {
-						sendEvent(w, flusher, ToolCallArgsEvent{
-							BaseEvent:  BaseEvent{Type: EventTypeToolCallArgs, Timestamp: nowMillis()},
-							ToolCallID: tc.ID,
-							Delta:      tc.Function.Arguments,
-						})
-					}
-					// 注意：工具调用结束需要更复杂的逻辑来判断
 				}
-			}
-		}
-	}
-}
+				if id == "" {
+					continue
+				}
 
-// sendEvent 发送 SSE 事件
-func sendEvent(w http.ResponseWriter, flusher http.Flusher, event interface{}) {
-	data, err := json.Marshal(event)
-	if err != nil {
-		log.Printf("[CopilotKit Runtime] failed to marshal event: %v", err)
-		return
-	}
-
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
-}
-
-// nowMillis 返回当前毫秒时间戳
-func nowMillis() int64 {
-	return time.Now().UnixMilli()
-}
+				p, ok := pendingCalls[id]
+				if !ok {
+					p = &pendingToolCall{ID: id, Type: tc.Type}
+					pendingCalls[id] = p
+					run.emit(ToolCallStartEvent{
+						BaseEvent:    BaseEvent{Type: EventTypeToolCallStart, Timestamp: nowMillis()},
+						ToolCallID:   id,
+						ToolCallName: tc.Function.Name,
+					})
+				}
+				if tc.Function.Name != "" {
+					p.Name = tc.Function.Name
+				}
+				if tc.Function.Arguments != "" {
+					p.Arguments += tc.Function.Arguments
+					run.emit(ToolCallArgsEvent{
+						BaseEvent:  BaseEvent{Type: EventTypeToolCallArgs, Timestamp: nowMillis()},
+		

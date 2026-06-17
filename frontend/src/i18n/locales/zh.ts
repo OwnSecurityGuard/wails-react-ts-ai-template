@@ -118,6 +118,7 @@ export default {
     baseURL: 'Base URL',
     model: '模型',
     maxTokens: '最大 Token 数',
+    maxTokensMin: '最大 Token 数至少为 1',
     temperature: '温度',
     configSaved: '配置已保存',
     configError: '配置保存失败',

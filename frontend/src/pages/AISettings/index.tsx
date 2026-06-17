@@ -163,7 +163,10 @@ const AISettings: React.FC = () => {
           <Form.Item
             name="max_tokens"
             label={t('ai.maxTokens')}
-            rules={[{ required: true }]}
+            rules={[
+              { required: true },
+              { type: 'number', min: 1, message: t('ai.maxTokensMin') },
+            ]}
           >
             <InputNumber min={1} max={32768} style={{ width: '100%' }} />
           </Form.Item>

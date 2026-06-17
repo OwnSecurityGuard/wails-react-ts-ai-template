@@ -118,6 +118,7 @@ export default {
     baseURL: 'Base URL',
     model: 'Model',
     maxTokens: 'Max Tokens',
+    maxTokensMin: 'Max tokens must be at least 1',
     temperature: 'Temperature',
     configSaved: 'Configuration saved',
     configError: 'Failed to save configuration',
