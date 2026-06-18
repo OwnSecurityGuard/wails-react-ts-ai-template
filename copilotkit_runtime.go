@@ -716,7 +716,7 @@ streamLoop:
 
 				p, ok := pendingCalls[id]
 				if !ok {
-					p = &pendingToolCall{ID: id, Type: tc.Type}
+					p = &pendingToolCall{ID: id, Type: string(tc.Type)}
 					pendingCalls[id] = p
 					run.emit(ToolCallStartEvent{
 						BaseEvent:    BaseEvent{Type: EventTypeToolCallStart, Timestamp: nowMillis()},
@@ -731,4 +731,152 @@ streamLoop:
 					p.Arguments += tc.Function.Arguments
 					run.emit(ToolCallArgsEvent{
 						BaseEvent:  BaseEvent{Type: EventTypeToolCallArgs, Timestamp: nowMillis()},
-		
+						ToolCallID: id,
+						Delta:      tc.Function.Arguments,
+					})
+				}
+			}
+		}
+	}
+
+	run.emit(TextMessageEndEvent{
+		BaseEvent: BaseEvent{Type: EventTypeTextMessageEnd, Timestamp: nowMillis()},
+		MessageID: messageID,
+	})
+
+	if len(pendingCalls) == 0 {
+		// 普通 assistant 回复
+		if contentBuf.Len() > 0 {
+			run.appendMessages(openai.ChatCompletionMessage{
+				Role:    "assistant",
+				Content: contentBuf.String(),
+			})
+		}
+		return false, nil
+	}
+
+	// 本轮产生了工具调用，构建 assistant 的 tool_calls 消息并追加
+	toolCalls := make([]openai.ToolCall, 0, len(pendingCalls))
+	aguiToolCalls := make([]AGUIToolCall, 0, len(pendingCalls))
+	for _, p := range pendingCalls {
+		toolCalls = append(toolCalls, openai.ToolCall{
+			ID:   p.ID,
+			Type: openai.ToolType(p.Type),
+			Function: openai.FunctionCall{
+				Name:      p.Name,
+				Arguments: p.Arguments,
+			},
+		})
+		aguiToolCalls = append(aguiToolCalls, AGUIToolCall{
+			ID:   p.ID,
+			Type: p.Type,
+			Function: AGUIToolFunction{
+				Name:      p.Name,
+				Arguments: p.Arguments,
+			},
+		})
+		run.emit(ToolCallEndEvent{
+			BaseEvent:  BaseEvent{Type: EventTypeToolCallEnd, Timestamp: nowMillis()},
+			ToolCallID: p.ID,
+		})
+	}
+
+	run.appendMessages(openai.ChatCompletionMessage{
+		Role:      "assistant",
+		Content:   contentBuf.String(),
+		ToolCalls: toolCalls,
+	})
+
+	run.emit(RunWaitingForToolResultsEvent{
+		BaseEvent: BaseEvent{Type: EventTypeRunWaitingForToolResults, Timestamp: nowMillis()},
+		ThreadID:  run.threadID,
+		RunID:     run.runID,
+		ToolCalls: aguiToolCalls,
+	})
+
+	return true, nil
+}
+
+// convertAGUIMessages 把 AG-UI 消息转为 OpenAI 消息格式
+func convertAGUIMessages(msgs []AGUIMessage) []openai.ChatCompletionMessage {
+	out := make([]openai.ChatCompletionMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		content := ""
+		switch v := msg.Content.(type) {
+		case string:
+			content = v
+		case []interface{}:
+			// 多模态内容，简化处理取第一个 text
+			for _, item := range v {
+				if m, ok := item.(map[string]interface{}); ok {
+					if m["type"] == "text" {
+						if text, ok := m["text"].(string); ok {
+							content = text
+							break
+						}
+					}
+				}
+			}
+		}
+
+		om := openai.ChatCompletionMessage{
+			Role:       msg.Role,
+			Content:    content,
+			Name:       msg.Name,
+			ToolCallID: msg.ToolCallID,
+		}
+		if len(msg.ToolCalls) > 0 {
+			tcs := make([]openai.ToolCall, 0, len(msg.ToolCalls))
+			for _, tc := range msg.ToolCalls {
+				tcs = append(tcs, openai.ToolCall{
+					ID:   tc.ID,
+					Type: openai.ToolType(tc.Type),
+					Function: openai.FunctionCall{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				})
+			}
+			om.ToolCalls = tcs
+		}
+		out = append(out, om)
+	}
+	return out
+}
+
+// convertAGUITools 把 AG-UI 工具定义转为 OpenAI 工具格式
+func convertAGUITools(tools []AGUITool) []openai.Tool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]openai.Tool, 0, len(tools))
+	for _, tool := range tools {
+		paramsJSON, _ := json.Marshal(tool.Parameters)
+		out = append(out, openai.Tool{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  paramsJSON,
+			},
+		})
+	}
+	return out
+}
+
+// sendEvent 发送 SSE 事件
+func sendEvent(w http.ResponseWriter, flusher http.Flusher, event interface{}) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("[CopilotKit Runtime] failed to marshal event: %v", err)
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher.Flush()
+}
+
+// nowMillis 返回当前毫秒时间戳
+func nowMillis() int64 {
+	return time.Now().UnixMilli()
+}
